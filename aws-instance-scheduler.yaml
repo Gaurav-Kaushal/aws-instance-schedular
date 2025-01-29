@@ -1,6 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-01'
 Description: 'EC2 Instance Scheduler with Slack Notifications'
 
+# --------------------
+# Parameters
+# --------------------
 Parameters:
   WorkingHoursStart:
     Type: String
@@ -16,6 +19,9 @@ Parameters:
     Type: String
     Description: 'Slack Webhook URL for notifications'
 
+# --------------------
+# IAM Role for Lambda
+# --------------------
 Resources:
   InstanceSchedulerRole:
     Type: AWS::IAM::Role
@@ -44,6 +50,9 @@ Resources:
                   - rds:DescribeDBInstances
                 Resource: '*'
 
+# --------------------
+# Lambda Function: EC2 Instance Scheduler
+# --------------------
   InstanceSchedulerFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -89,6 +98,9 @@ Resources:
         Variables:
           SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
 
+# --------------------
+# EventBridge Rules for Scheduling
+# --------------------
   StartInstancesRule:
     Type: AWS::Events::Rule
     Properties:
@@ -109,6 +121,9 @@ Resources:
           Id: StopInstancesTarget
           Input: '{"action": "stop"}'
 
+# --------------------
+# Lambda Permissions for EventBridge
+# --------------------
   StartInstancesPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -125,6 +140,9 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt StopInstancesRule.Arn
 
+# --------------------
+# Lambda Function: Untagged Resources Checker
+# --------------------
   UntaggedResourcesFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -171,6 +189,9 @@ Resources:
         Variables:
           SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
 
+# --------------------
+# Daily Resource Check Rule
+# --------------------
   DailyResourceCheck:
     Type: AWS::Events::Rule
     Properties:
@@ -188,6 +209,9 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt DailyResourceCheck.Arn
 
+# --------------------
+# Outputs
+# --------------------
 Outputs:
   InstanceSchedulerFunction:
     Description: 'Instance Scheduler Lambda Function ARN'
