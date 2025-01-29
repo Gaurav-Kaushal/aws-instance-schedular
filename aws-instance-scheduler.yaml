@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-01'
+Description: 'EC2 Instance Scheduler with Slack Notifications'
+
+Parameters:
+  WorkingHoursStart:
+    Type: String
+    Default: '0800'
+    Description: 'Start time in 24hr format (UTC)'
+
+  WorkingHoursEnd:
+    Type: String
+    Default: '1700'
+    Description: 'End time in 24hr format (UTC)'
+
+  SlackWebhookUrl:
+    Type: String
+    Description: 'Slack Webhook URL for notifications'
+
+Resources:
+  InstanceSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2Management
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeAddresses
+                  - rds:DescribeDBInstances
+                Resource: '*'
+
+  InstanceSchedulerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt InstanceSchedulerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import requests
+          from datetime import datetime
+          
+          def notify_slack(message):
+              webhook_url = os.environ['SLACK_WEBHOOK_URL']
+              requests.post(webhook_url, json={'text': message})
+          
+          def handler(event, context):
+              ec2 = boto3.client('ec2')
+              action = event['action']
+              
+              # Get instances with AutoStop tag
+              response = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'tag:AutoStop', 'Values': ['true']}
+                  ]
+              )
+              
+              instance_ids = [inst['InstanceId'] for res in response['Reservations'] for inst in res['Instances']]
+              
+              if not instance_ids:
+                  return
+              
+              if action == 'start':
+                  ec2.start_instances(InstanceIds=instance_ids)
+                  notify_slack(f"Started instances: {', '.join(instance_ids)}")
+              elif action == 'stop':
+                  ec2.stop_instances(InstanceIds=instance_ids)
+                  notify_slack(f"Stopped instances: {', '.join(instance_ids)}")
+
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+
+  StartInstancesRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Sub cron(${WorkingHoursStart} ? * MON-FRI *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InstanceSchedulerFunction.Arn
+          Id: StartInstancesTarget
+          Input: '{"action": "start"}'
+
+  StopInstancesRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Sub cron(${WorkingHoursEnd} ? * MON-FRI *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InstanceSchedulerFunction.Arn
+          Id: StopInstancesTarget
+          Input: '{"action": "stop"}'
+
+  StartInstancesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InstanceSchedulerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartInstancesRule.Arn
+
+  StopInstancesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InstanceSchedulerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopInstancesRule.Arn
+
+  UntaggedResourcesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt InstanceSchedulerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import requests
+          import os
+          
+          def notify_slack(message):
+              webhook_url = os.environ['SLACK_WEBHOOK_URL']
+              requests.post(webhook_url, json={'text': message})
+          
+          def handler(event, context):
+              ec2 = boto3.client('ec2')
+              rds = boto3.client('rds')
+              
+              untagged_resources = []
+              
+              # Check EC2 instances
+              for reservation in ec2.describe_instances()['Reservations']:
+                  for instance in reservation['Instances']:
+                      if not instance.get('Tags'):
+                          untagged_resources.append(f"EC2: {instance['InstanceId']}")
+              
+              # Check EBS volumes
+              for volume in ec2.describe_volumes()['Volumes']:
+                  if not volume.get('Tags'):
+                      untagged_resources.append(f"EBS: {volume['VolumeId']}")
+              
+              # Check Elastic IPs
+              for eip in ec2.describe_addresses()['Addresses']:
+                  if not eip.get('Tags'):
+                      untagged_resources.append(f"EIP: {eip['PublicIp']}")
+              
+              if untagged_resources:
+                  notify_slack("Untagged resources found:\n" + "\n".join(untagged_resources))
+
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+
+  DailyResourceCheck:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(0 0 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt UntaggedResourcesFunction.Arn
+          Id: DailyResourceCheckTarget
+
+  DailyResourceCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UntaggedResourcesFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyResourceCheck.Arn
+
+Outputs:
+  InstanceSchedulerFunction:
+    Description: 'Instance Scheduler Lambda Function ARN'
+    Value: !GetAtt InstanceSchedulerFunction.Arn
+
+  UntaggedResourcesFunction:
+    Description: 'Untagged Resources Check Lambda Function ARN'
+    Value: !GetAtt UntaggedResourcesFunction.Arn
