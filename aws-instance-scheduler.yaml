@@ -48,6 +48,8 @@ Resources:
                   - ec2:DescribeVolumes
                   - ec2:DescribeAddresses
                   - rds:DescribeDBInstances
+                  - rds:StartDBInstance
+                  - rds:StopDBInstance
                 Resource: '*'
 
 # --------------------
