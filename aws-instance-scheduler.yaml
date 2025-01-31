@@ -51,55 +51,74 @@ Resources:
                   - rds:StartDBInstance
                   - rds:StopDBInstance
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
 
 # --------------------
 # Lambda Function: EC2 Instance Scheduler
 # --------------------
-  InstanceSchedulerFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      Handler: index.handler
-      Role: !GetAtt InstanceSchedulerRole.Arn
-      Code:
-        ZipFile: |
-          import boto3
-          import os
-          import requests
-          from datetime import datetime
-          
-          def notify_slack(message):
-              webhook_url = os.environ['SLACK_WEBHOOK_URL']
-              requests.post(webhook_url, json={'text': message})
-          
-          def handler(event, context):
-              ec2 = boto3.client('ec2')
-              action = event['action']
-              
-              # Get instances with AutoStop tag
-              response = ec2.describe_instances(
-                  Filters=[
-                      {'Name': 'tag:AutoStop', 'Values': ['true']}
-                  ]
-              )
-              
-              instance_ids = [inst['InstanceId'] for res in response['Reservations'] for inst in res['Instances']]
-              
-              if not instance_ids:
-                  return
-              
-              if action == 'start':
-                  ec2.start_instances(InstanceIds=instance_ids)
-                  notify_slack(f"Started instances: {', '.join(instance_ids)}")
-              elif action == 'stop':
-                  ec2.stop_instances(InstanceIds=instance_ids)
-                  notify_slack(f"Stopped instances: {', '.join(instance_ids)}")
+InstanceSchedulerFunction:
+  Type: AWS::Lambda::Function
+  Properties:
+    Handler: index.handler
+    Role: !GetAtt InstanceSchedulerRole.Arn
+    Code:
+      ZipFile: |
+        import boto3
+        import os
+        import json
+        import requests
+        import logging
 
-      Runtime: python3.9
-      Timeout: 300
-      Environment:
-        Variables:
-          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
 
+        def get_secret():
+            secret_name = os.environ['SLACK_SECRET_NAME']
+            client = boto3.client('secretsmanager')
+            
+            try:
+                response = client.get_secret_value(SecretId=secret_name)
+                return json.loads(response['SecretString'])['webhook_url']
+            except Exception as e:
+                logger.error(f"Error fetching secret: {e}")
+                return None
+
+        def notify_slack(message):
+            webhook_url = get_secret()
+            if webhook_url:
+                requests.post(webhook_url, json={'text': message})
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            action = event['action']
+            logger.info(f"Received event: {event}")
+            
+            response = ec2.describe_instances(
+                Filters=[{'Name': 'tag:AutoStop', 'Values': ['true']}]
+            )
+            
+            instance_ids = [inst['InstanceId'] for res in response['Reservations'] for inst in res['Instances']]
+            
+            if not instance_ids:
+                logger.info("No instances found for scheduling.")
+                return
+            
+            if action == 'start':
+                ec2.start_instances(InstanceIds=instance_ids)
+                notify_slack(f"Started instances: {', '.join(instance_ids)}")
+            elif action == 'stop':
+                ec2.stop_instances(InstanceIds=instance_ids)
+                notify_slack(f"Stopped instances: {', '.join(instance_ids)}")
+
+    Runtime: python3.9
+    Timeout: 300
+    Environment:
+      Variables:
+        SLACK_SECRET_NAME: !Ref SlackWebhookSecret
+        
 # --------------------
 # EventBridge Rules for Scheduling
 # --------------------
@@ -116,7 +135,7 @@ Resources:
   StopInstancesRule:
     Type: AWS::Events::Rule
     Properties:
-      SScheduleExpression: !Sub "cron(${WorkingHoursEnd:2:2} ${WorkingHoursEnd:0:2} ? * MON-FRI *)"
+      ScheduleExpression: !Sub "cron(${WorkingHoursEnd:2:2} ${WorkingHoursEnd:0:2} ? * MON-FRI *)"
       State: ENABLED
       Targets:
         - Arn: !GetAtt InstanceSchedulerFunction.Arn
